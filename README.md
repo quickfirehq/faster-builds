@@ -17,10 +17,12 @@ The full article, with more on each step: [How to read your build timeline and f
 | [`time-build.sh`](scripts/time-build.sh) | Times the same build several times and prints the median | 2 |
 | [`timing-summary.sh`](scripts/timing-summary.sh) | Prints the build's time by kind of task, and the script phases that run on every build | 3, 5 |
 | [`slow-type-checks.sh`](scripts/slow-type-checks.sh) | Lists the functions and expressions slowest to type-check | 5 |
+| [`build_baseline.py`](scripts/build_baseline.py) | Does steps 2 and 3 in one command, with step 5's type-check list if you ask: finds the workspace, scheme and Simulator, makes the edits for you and puts them back | 2, 3, 5 |
 
-They need macOS with Xcode installed (`xcode-select -p` shows which one runs) and nothing else: they're `zsh`
-scripts, the shell every Mac has. None of them changes your project. Each takes your usual `xcodebuild`
-arguments after `--`:
+They need macOS with Xcode installed (`xcode-select -p` shows which one runs) and nothing else: the `.sh` scripts
+are `zsh`, the shell every Mac has, and `build_baseline.py` uses the `python3` that comes with Xcode. None of the
+`.sh` scripts changes your project (`build_baseline.py` edits two files for a while and puts them back; see
+below). Each `.sh` script takes your usual `xcodebuild` arguments after `--`:
 
 ```sh
 git clone https://github.com/quickfirehq/faster-builds.git
@@ -30,6 +32,60 @@ path/to/faster-builds/scripts/time-build.sh -- -scheme MyApp -destination "platf
 
 Add `-workspace MyApp.xcworkspace` or `-project MyApp.xcodeproj` when the folder has more than one. Run any
 script with `-h` for its options. Tested with Xcode 27.1.
+
+## The whole baseline in one command
+
+`build_baseline.py` runs steps 2 and 3 for you. Run it from the folder with your workspace or project:
+
+```sh
+cd path/to/your/app
+python3 path/to/faster-builds/scripts/build_baseline.py
+```
+
+It finds the workspace or project, the scheme that builds the app and a Simulator with the newest OS, builds once
+without timing, then times each of the three builds from step 2 three times and prints the medians, the timing
+summary of each, and the script phases that ran in a no-change build:
+
+```
+Results (median of 3 builds)
+  No-change build         1.02 s  (0.99 to 1.03)     0 source files compiled
+  Function-body edit      1.39 s  (1.37 to 1.79)     1 source file compiled
+  Shared-type edit        1.90 s  (1.83 to 2.09)     8 source files compiled
+
+Timing summary of the median build, by kind of task (seconds, summed across cores):
+                                       no change   body edit shared type
+  SwiftCompile                                 -        0.17        1.51
+  Ld                                           -           -        0.34
+  SwiftEmitModule                              -        0.13        0.28
+  ...
+  PhaseScriptExecution                      0.01        0.01        0.01
+
+Script phases that ran in a no-change build:
+  'Stamp build' in target 'Shop'  (declares no outputs)
+```
+
+(From a tiny sample app with eight source files; yours will be longer.)
+
+To make the two edits, it adds one line inside a function in a file few others depend on, then one property to
+the type that the most files mention, with a new value for each build. It edits only files that git tracks and
+that have no uncommitted changes, checks that each build really compiled the edited file, and puts the files back
+when it finishes, fails or is stopped with Ctrl-C. Putting the shared type back changes it again, so your next
+build recompiles the files that use it, once.
+
+Useful options (`-h` lists them all):
+
+- `--plan` shows what it would build and which files it would edit, without building.
+- `--quick` times each build once instead of three times.
+- `--body-file`, `--shared-file` and `--shared-type` pick the edits yourself; `--scheme`, `--destination`,
+  `--workspace` and `--project` override what it finds. Extra `xcodebuild` arguments go after `--`.
+- `--type-checks 100` adds step 5's list of the functions and expressions slower than 100 ms to type-check (a
+  full build into a temporary folder).
+- `--json` prints everything as JSON for scripts and coding agents: settings, each build's time and files
+  compiled, timing summaries, scripts, which files were edited and whether they were restored. Progress goes to
+  standard error.
+
+It builds into your usual DerivedData, so the times match the builds you wait for; `--derived-data` builds
+somewhere else.
 
 ## Step 1: See every build's total time
 
