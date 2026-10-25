@@ -12,7 +12,8 @@ It also prints the timing summary of each kind of build and the script phases th
 with --type-checks, the functions and expressions slowest to type-check.
 
 It changes your source files only to make the two edits, only files that git tracks and that have no
-uncommitted changes, and it always puts them back: when it finishes, fails or is stopped with Ctrl-C.
+uncommitted changes, and it always puts them back: when it finishes, fails or is stopped with Ctrl-C. If it is
+killed outright (kill -9, or a coding agent's time limit), the next run puts them back before it starts.
 Python 3.9 or later, standard library only.
 
 Examples:
@@ -302,6 +303,32 @@ class Git:
     def is_clean(self, path):
         self.refresh()
         return path in self.tracked and path not in self.dirty
+
+    def leftovers(self, fix):
+        """Files an earlier run left edited because it was killed before it could restore them (kill -9, or a
+        coding agent's time limit). When the marked line is a file's only change, `fix` removes it."""
+        if not self.root:
+            return []
+        _, out = run(["git", "-C", str(self.root), "grep", "-l", "-F", "-e", MARK, "--", "*.swift"])
+        found = []
+        for name in out.splitlines():
+            path = os.path.realpath(self.root / name)
+            _, diff = run(["git", "-C", str(self.root), "diff", "-U0", "--", name])
+            changed = [l for l in diff.splitlines()
+                       if l[:1] in "+-" and not l.startswith("+++") and not l.startswith("---")]
+            only_ours = bool(changed) and all(l.startswith("+") and MARK in l for l in changed)
+            if only_ours and fix:
+                text = Path(path).read_text()
+                Path(path).write_text("".join(l for l in text.splitlines(keepends=True) if MARK not in l))
+                found.append((path, "put back: an earlier run was stopped before it could restore it"))
+            elif only_ours:
+                found.append((path, "left edited by an earlier run that was stopped; the next run puts it back"))
+            else:
+                found.append((path, "has a line added by an earlier run, plus other changes: delete the line "
+                                    "ending in \"%s\" by hand (git checkout would drop your changes too)" % MARK))
+        if found:
+            self.refresh()
+        return found
 
 
 # --- picking the files to edit ------------------------------------------------------------------------------
@@ -901,6 +928,9 @@ def main(argv):
         baseline = Baseline(args, base_args, logs)
         wanted = [s for s in SCENARIOS if s not in args.skip]
         git = Git()
+        for path, status in git.leftovers(fix=not args.plan):
+            baseline.warnings.append("%s: %s" % (rel(path), status))
+            say("Note:         %s: %s" % (rel(path), status))
         objroot = build_settings.get("OBJROOT", "")
         for kind, path in (("body", args.body_file), ("shared", args.shared_file)):
             if path and kind in wanted:

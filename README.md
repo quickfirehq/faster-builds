@@ -69,8 +69,15 @@ Script phases that ran in a no-change build:
 To make the two edits, it adds one line inside a function in a file few others depend on, then one property to
 the type that the most files mention, with a new value for each build. It edits only files that git tracks and
 that have no uncommitted changes, checks that each build really compiled the edited file, and puts the files back
-when it finishes, fails or is stopped with Ctrl-C. Putting the shared type back changes it again, so your next
-build recompiles the files that use it, once.
+when it finishes, fails or is stopped with Ctrl-C. If it's killed outright, the next run puts them back first;
+`git checkout -- <file>` does it by hand. Putting the shared type back changes it again, so your next build
+recompiles the files that use it, once.
+
+It runs eleven builds (five with `--quick`), and the first is a full build if nothing is built yet: on a large
+app, that's 15 minutes or more even with `--quick`. Coding agents often stop a command after a few minutes, so
+ask yours to run it in the background, or give it a longer time limit. For example: "Run
+`python3 path/to/faster-builds/scripts/build_baseline.py --json > baseline.json` from the project folder in the
+background, wait for it to finish, then tell me the three medians and what the timing summaries show."
 
 Useful options (`-h` lists them all):
 
