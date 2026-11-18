@@ -5,12 +5,16 @@ It reads the settings of every target in the project, or in each project of the 
 with xcodebuild -showBuildSettings, and the script phases from the project files. It builds nothing and changes
 nothing. Swift packages keep their own settings and aren't checked. It reports:
 
-  worth changing   settings with a value that makes every debug build slower (whole-module compilation,
+  current values   every setting it checks, and how many targets have each value
+  to change        settings with a value that makes every debug build slower (whole-module compilation,
                    optimization, dSYM files, more than one architecture)
   every build      script phases that run on every build, and why
   differ           settings that differ between targets and make shared modules build more than once
-  worth trying     settings that may help, depending on the project (eager linking, index data from the
-                   command line, explicit modules, script sandboxing)
+  worth trying     settings that may help, depending on the project (eager linking, scripts in parallel,
+                   index data from the command line, explicit modules)
+
+Every finding names the setting as the Build Settings tab shows it and by its key, the value to use, why, and
+the section of https://quickfirebuild.com/blog/debug-build-settings/ that explains it.
 
 The checks assume the configuration you build all day (Debug unless you pass --configuration).
 Python 3.9 or later, standard library only.
@@ -135,126 +139,201 @@ def read_settings(projects, args):
 
 # --- the checks ---------------------------------------------------------------------------------------------
 
+ARTICLE = "https://quickfirebuild.com/blog/debug-build-settings/"
+
+
+def is_static(s):
+    return s.get("MACH_O_TYPE") == "staticlib"
+
+
+def is_dynamic_framework(s):
+    return s.get("PRODUCT_TYPE") == "com.apple.product-type.framework" and s.get("MACH_O_TYPE") == "mh_dylib"
+
+
+# Each setting the report shows. "slow" says whether a target's value slows every build of the configuration
+# (None: the value is shown, but never reported as a problem by itself).
+SETTINGS = [
+    {"key": "SWIFT_COMPILATION_MODE", "name": "Compilation Mode", "recommended": "singlefile",
+     "shown_as": "Incremental", "anchor": "1-compilation-mode",
+     "slow": lambda s: s.get("SWIFT_COMPILATION_MODE") == "wholemodule",
+     "why": "Whole Module recompiles every Swift file in the module after any change, in one compiler process. "
+            "Keep it for release builds."},
+    {"key": "SWIFT_OPTIMIZATION_LEVEL", "name": "Optimization Level (Swift)", "recommended": "-Onone",
+     "shown_as": "no optimization", "anchor": "2-optimization-level",
+     "slow": lambda s: s.get("SWIFT_OPTIMIZATION_LEVEL", "-Onone") not in ("-Onone", ""),
+     "why": "The optimizer adds compile time to every build and makes debugging harder. Turn it on only in "
+            "the one target that needs it, or profile a release build."},
+    {"key": "GCC_OPTIMIZATION_LEVEL", "name": "Optimization Level (C and Objective-C)", "recommended": "0",
+     "shown_as": "no optimization", "anchor": "2-optimization-level",
+     "slow": lambda s: s.get("GCC_OPTIMIZATION_LEVEL", "0") not in ("0", ""),
+     "why": "The optimizer adds compile time to every build and makes debugging harder."},
+    {"key": "DEBUG_INFORMATION_FORMAT", "name": "Debug Information Format", "recommended": "dwarf",
+     "shown_as": "DWARF", "anchor": "3-debug-information-format",
+     "slow": lambda s: s.get("DEBUG_INFORMATION_FORMAT") == "dwarf-with-dsym" and not is_static(s),
+     "why": "DWARF with dSYM File runs an extra step after every link to write the dSYM. Only builds you ship "
+            "or hand to testers need one."},
+    {"key": "ONLY_ACTIVE_ARCH", "name": "Build Active Architecture Only", "recommended": "YES",
+     "shown_as": "Yes", "anchor": "4-build-active-architecture-only",
+     "slow": lambda s: s.get("ONLY_ACTIVE_ARCH", "NO") != "YES",
+     "why": "With No, every architecture the target supports is compiled, not only the one you run on."},
+    {"key": "ENABLE_USER_SCRIPT_SANDBOXING", "name": "User Script Sandboxing", "recommended": "YES",
+     "shown_as": "Yes", "anchor": "5-script-phases", "slow": None,
+     "why": "Fails the build when a script uses a file it didn't declare, which keeps input and output lists "
+            "honest."},
+    {"key": "FUSE_BUILD_SCRIPT_PHASES", "name": "Run Build Script Phases in Parallel", "recommended": "YES",
+     "shown_as": "Yes", "anchor": "5-script-phases", "slow": None,
+     "why": "Lets a target's script phases run in parallel, once every one declares complete inputs and outputs."},
+    {"key": "SWIFT_ENABLE_EXPLICIT_MODULES", "name": "Explicitly Built Modules", "recommended": "YES",
+     "shown_as": "Yes", "anchor": "6-settings-that-shape-modules", "slow": None,
+     "why": "The default for Swift since Xcode 26. If it was turned off to work around an error, try it again."},
+    {"key": "COMPILER_INDEX_STORE_ENABLE", "name": "Enable Index-While-Building Functionality",
+     "recommended": "Default", "shown_as": "Default (NO on the command line)", "anchor": "7-index-data",
+     "slow": None,
+     "why": "Leave it for builds in the IDE. Command-line builds (CI, coding agents) can pass "
+            "COMPILER_INDEX_STORE_ENABLE=NO, with a build folder of their own."},
+    {"key": "EAGER_LINKING", "name": "Eager Linking", "recommended": "YES", "shown_as": "Yes",
+     "anchor": "8-eager-linking", "slow": None,
+     "why": "For Swift-only dynamic frameworks: the targets that link them can start linking sooner."},
+]
+
+# Settings that, per Apple's "Demystify explicitly built modules" (WWDC24), make the same module build once per
+# distinct value: preprocessor macros, C language standards and automatic reference counting.
+VARIANT_SETTINGS = [
+    ("GCC_PREPROCESSOR_DEFINITIONS", "Preprocessor Macros"),
+    ("GCC_C_LANGUAGE_STANDARD", "C Language Dialect"),
+    ("CLANG_ENABLE_OBJC_ARC", "Objective-C Automatic Reference Counting"),
+]
+
+
 def label(names, limit=4):
     names = sorted(names)
     shown = ", ".join(names[:limit])
     return shown + (" and %d more" % (len(names) - limit) if len(names) > limit else "")
 
 
-def targets_where(entries, test):
-    return [e["label"] for e in entries if test(e["buildSettings"])]
+def value_of(e, key):
+    return " ".join(e["buildSettings"].get(key, "").split())
 
 
-def worth_changing(entries):
+def current_values(entries):
+    """For each setting, which targets have which value."""
+    rows = []
+    for spec in SETTINGS:
+        by_value = {}
+        for e in entries:
+            by_value.setdefault(value_of(e, spec["key"]) or "(not set: default)", []).append(e["label"])
+        rows.append({"setting": spec["key"], "name": spec["name"],
+                     "values": [{"value": v, "targets": sorted(t)}
+                                for v, t in sorted(by_value.items(), key=lambda kv: -len(kv[1]))]})
+    return rows
+
+
+def to_change(entries):
     """Values that make every build of the configuration slower."""
-    rules = [
-        ("SWIFT_COMPILATION_MODE", "Compilation Mode is Whole Module",
-         lambda s: s.get("SWIFT_COMPILATION_MODE") == "wholemodule",
-         "set it to Incremental (singlefile): Whole Module recompiles every Swift file in the module on every change"),
-        ("SWIFT_OPTIMIZATION_LEVEL", "Swift optimization is on",
-         lambda s: s.get("SWIFT_OPTIMIZATION_LEVEL", "-Onone") not in ("-Onone", ""),
-         "set Optimization Level to None (-Onone): the optimizer adds compile time to every build"),
-        ("GCC_OPTIMIZATION_LEVEL", "C and Objective-C optimization is on",
-         lambda s: s.get("GCC_OPTIMIZATION_LEVEL", "0") not in ("0", ""),
-         "set Optimization Level to None (0)"),
-        ("DEBUG_INFORMATION_FORMAT", "Debug Information Format is DWARF with dSYM File",
-         lambda s: s.get("DEBUG_INFORMATION_FORMAT") == "dwarf-with-dsym" and s.get("MACH_O_TYPE") != "staticlib",
-         "set it to DWARF: a dSYM is generated after every link, and only builds you ship or hand to testers "
-         "need one"),
-        ("ONLY_ACTIVE_ARCH", "Build Active Architecture Only is off",
-         lambda s: s.get("ONLY_ACTIVE_ARCH", "NO") != "YES",
-         "set it to Yes: otherwise every architecture the target supports is compiled"),
-    ]
     found = []
-    for key, what, test, fix in rules:
-        targets = targets_where(entries, test)
-        if targets:
-            values = sorted({e["buildSettings"].get(key, "") for e in entries if e["label"] in targets})
-            found.append({"setting": key, "problem": what, "fix": fix, "targets": sorted(targets),
-                          "values": values})
+    for spec in SETTINGS:
+        if not spec["slow"]:
+            continue
+        bad = [e for e in entries if spec["slow"](e["buildSettings"])]
+        if bad:
+            found.append({"setting": spec["key"], "name": spec["name"],
+                          "current": sorted({value_of(e, spec["key"]) or "(not set)" for e in bad}),
+                          "recommended": spec["recommended"], "shown_as": spec["shown_as"],
+                          "targets": sorted(e["label"] for e in bad), "why": spec["why"],
+                          "article": ARTICLE + "#" + spec["anchor"]})
     return found
-
-
-# Settings that, per Apple's "Demystify explicitly built modules" (WWDC24), make the same module build once per
-# distinct value: preprocessor macros, C language standards and automatic reference counting.
-VARIANT_SETTINGS = [
-    "GCC_PREPROCESSOR_DEFINITIONS",
-    "GCC_C_LANGUAGE_STANDARD",
-    "CLANG_ENABLE_OBJC_ARC",
-]
 
 
 def differing(entries):
-    compiling = [e for e in entries
-                 if e["buildSettings"].get("PRODUCT_TYPE", "") and "aggregate" not in e["buildSettings"].get(
-                     "PRODUCT_TYPE", "")]
+    compiling = [e for e in entries if "aggregate" not in e["buildSettings"].get("PRODUCT_TYPE", "aggregate")]
     found = []
-    for key in VARIANT_SETTINGS:
+    for key, name in VARIANT_SETTINGS:
         by_value = {}
         for e in compiling:
-            value = " ".join(e["buildSettings"].get(key, "").split())
-            by_value.setdefault(value, []).append(e["label"])
+            by_value.setdefault(value_of(e, key) or "(not set)", []).append(e["label"])
         if len(by_value) > 1:
-            found.append({"setting": key,
+            found.append({"setting": key, "name": name,
                           "values": [{"value": v, "targets": sorted(t)} for v, t in
-                                     sorted(by_value.items(), key=lambda kv: -len(kv[1]))]})
-    return found
-
-
-def worth_trying(entries, command_line_index):
-    found = []
-    frameworks = targets_where(entries, lambda s: s.get("PRODUCT_TYPE") == "com.apple.product-type.framework"
-                               and s.get("MACH_O_TYPE") == "mh_dylib" and s.get("EAGER_LINKING", "NO") != "YES")
-    if frameworks:
-        found.append({"setting": "EAGER_LINKING", "targets": sorted(frameworks),
-                      "note": "Eager Linking is off for these dynamic frameworks. If a framework is Swift only, "
-                              "turning it on lets the targets that link it start linking sooner."})
-    no_explicit = targets_where(entries, lambda s: s.get("SWIFT_ENABLE_EXPLICIT_MODULES", "YES") == "NO")
-    if no_explicit:
-        found.append({"setting": "SWIFT_ENABLE_EXPLICIT_MODULES", "targets": sorted(no_explicit),
-                      "note": "Explicitly Built Modules is turned off. It has been the default for Swift since "
-                              "Xcode 26; if it was turned off to work around an error, try it again."})
-    if command_line_index:
-        found.append({"setting": "COMPILER_INDEX_STORE_ENABLE", "targets": [],
-                      "note": "Debug builds also write index data, for code navigation in the editor. Builds from "
-                              "the command line (CI, coding agents) can skip it: add COMPILER_INDEX_STORE_ENABLE=NO "
-                              "to the xcodebuild command, with a build folder of their own (-derivedDataPath)."})
+                                     sorted(by_value.items(), key=lambda kv: -len(kv[1]))],
+                          "why": "Each different value can build the same modules again. Set it once at the "
+                                 "project level (or in a shared .xcconfig) unless a target really needs its own.",
+                          "article": ARTICLE + "#6-settings-that-shape-modules"})
     return found
 
 
 def script_phases(entries):
-    """Script phases that run on every build, read from the project files."""
+    """Script phases that run on every build, and targets whose scripts could run in parallel."""
     by_project = {}
     for e in entries:
         by_project.setdefault(e["path"], []).append(e)
-    found, unread = [], []
+    every_build, could_fuse, unread = [], [], []
     for project, members in sorted(by_project.items()):
-        labels = {e["target"]: e["label"] for e in members}
-        sandboxed = {e["target"]: e["buildSettings"].get("ENABLE_USER_SCRIPT_SANDBOXING", "NO") == "YES"
-                     for e in members}
+        by_name = {e["target"]: e for e in members}
         code, out, _ = run(["plutil", "-convert", "json", "-o", "-", str(Path(project) / "project.pbxproj")])
         if code != 0:
             unread.append(project)
             continue
         objects = json.loads(out).get("objects", {})
         for obj in objects.values():
-            if obj.get("isa") not in ("PBXNativeTarget", "PBXAggregateTarget") or obj.get("name") not in labels:
+            if obj.get("isa") not in ("PBXNativeTarget", "PBXAggregateTarget") or obj.get("name") not in by_name:
                 continue
+            e = by_name[obj["name"]]
+            scripts, analysed = 0, 0
             for phase_id in obj.get("buildPhases", []):
                 phase = objects.get(phase_id, {})
                 if phase.get("isa") != "PBXShellScriptBuildPhase":
                     continue
                 if phase.get("runOnlyForDeploymentPostprocessing") == "1":
                     continue  # "For install builds only"
+                scripts += 1
                 if phase.get("alwaysOutOfDate") == "1":
                     why = "\"Based on dependency analysis\" is off"
                 elif not phase.get("outputPaths") and not phase.get("outputFileListPaths"):
                     why = "it declares no output files"
+                elif not phase.get("inputPaths") and not phase.get("inputFileListPaths"):
+                    why = "it declares no input files"
                 else:
+                    analysed += 1
                     continue
-                found.append({"target": labels[obj["name"]], "phase": phase.get("name") or "Run Script",
-                              "why": why, "sandboxed": sandboxed.get(obj["name"], False)})
-    return found, unread
+                every_build.append({"target": e["label"], "phase": phase.get("name") or "Run Script", "why": why})
+            settings = e["buildSettings"]
+            if (scripts >= 2 and analysed == scripts and settings.get("FUSE_BUILD_SCRIPT_PHASES", "NO") != "YES"
+                    and settings.get("ENABLE_USER_SCRIPT_SANDBOXING", "NO") == "YES"):
+                could_fuse.append(e["label"])
+    return every_build, could_fuse, unread
+
+
+def worth_trying(entries, could_fuse, command_line_index):
+    found = []
+    frameworks = [e["label"] for e in entries
+                  if is_dynamic_framework(e["buildSettings"]) and e["buildSettings"].get("EAGER_LINKING") != "YES"]
+    if frameworks:
+        found.append({"setting": "EAGER_LINKING", "name": "Eager Linking", "recommended": "YES",
+                      "targets": sorted(frameworks),
+                      "why": "These dynamic frameworks don't use it. If a framework is Swift only, turning it on "
+                             "lets the targets that link it start linking sooner.",
+                      "article": ARTICLE + "#8-eager-linking"})
+    if could_fuse:
+        found.append({"setting": "FUSE_BUILD_SCRIPT_PHASES", "name": "Run Build Script Phases in Parallel",
+                      "recommended": "YES", "targets": sorted(could_fuse),
+                      "why": "Every script phase in these targets declares its inputs and outputs and sandboxing "
+                             "is on, so their scripts could run in parallel instead of one at a time.",
+                      "article": ARTICLE + "#5-script-phases"})
+    no_explicit = [e["label"] for e in entries if e["buildSettings"].get("SWIFT_ENABLE_EXPLICIT_MODULES") == "NO"]
+    if no_explicit:
+        found.append({"setting": "SWIFT_ENABLE_EXPLICIT_MODULES", "name": "Explicitly Built Modules",
+                      "recommended": "YES", "targets": sorted(no_explicit),
+                      "why": "Turned off in these targets. It has been the default for Swift since Xcode 26; if "
+                             "it was turned off to work around an error, try it again.",
+                      "article": ARTICLE + "#6-settings-that-shape-modules"})
+    if command_line_index:
+        found.append({"setting": "COMPILER_INDEX_STORE_ENABLE", "name": "Enable Index-While-Building Functionality",
+                      "recommended": "NO on the command line", "targets": [],
+                      "why": "Debug builds also write index data for the editor. Builds from the command line (CI, "
+                             "coding agents) can skip it: add COMPILER_INDEX_STORE_ENABLE=NO to the xcodebuild "
+                             "command, with a build folder of their own (-derivedDataPath).",
+                      "article": ARTICLE + "#7-index-data"})
+    return found
 
 
 # --- report -------------------------------------------------------------------------------------------------
@@ -264,29 +343,36 @@ def xcode_version():
     return " ".join(out.split()) if code == 0 else "unknown"
 
 
+def counts(values):
+    return ", ".join("%s: %d" % (v["value"], len(v["targets"])) for v in values)
+
+
 def print_report(r):
     say("%s, %s configuration: %d target%s in %d project%s (%s)" % (
         r["container"], r["configuration"], len(r["targets"]), "" if len(r["targets"]) == 1 else "s",
         len(r["projects"]), "" if len(r["projects"]) == 1 else "s", r["xcode"]))
     say()
-    if r["worth_changing"]:
-        say("Worth changing (each one slows every build):")
-        for f in r["worth_changing"]:
-            say("  %s in %s." % (f["problem"], label(f["targets"])))
-            say("    Fix: %s. (%s)" % (f["fix"], f["setting"]))
+    say("Current values (value: number of targets):")
+    for row in r["current"]:
+        say("  %-42s %-30s %s" % (row["name"], row["setting"], counts(row["values"])))
+    say()
+    if r["to_change"]:
+        say("To change (each one slows every build):")
+        for i, f in enumerate(r["to_change"], 1):
+            say("  %d. %s (%s) is %s in %s." % (i, f["name"], f["setting"], " / ".join(f["current"]),
+                                                label(f["targets"])))
+            say("     Set it to %s (%s). %s" % (f["shown_as"], f["recommended"], f["why"]))
+            say("     More: %s" % f["article"])
     else:
-        say("Worth changing: nothing. Compilation mode, optimization, debug information and architectures "
-            "are set for fast builds.")
+        say("To change: nothing. Compilation mode, optimization, debug information and architectures are set for "
+            "fast builds.")
     say()
     if r["every_build"]:
         say("Script phases that run on every build:")
         for p in r["every_build"]:
             say("  %s > %s: %s." % (p["target"], p["phase"], p["why"]))
-        say("    Fix: give each one its input and output files, or move it out of the builds you make all day.")
-        if any(not p["sandboxed"] for p in r["every_build"]):
-            say("    User Script Sandboxing (ENABLE_USER_SCRIPT_SANDBOXING) fails the build when a script uses a "
-                "file it didn't declare,")
-            say("    which keeps the lists honest.")
+        say("     Give each one its input and output files, or move it out of the builds you make all day.")
+        say("     More: %s#5-script-phases" % ARTICLE)
     else:
         say("Script phases that run on every build: none.")
     for project in r["unreadable_projects"]:
@@ -295,18 +381,21 @@ def print_report(r):
     if r["differ"]:
         say("Settings that differ between targets (each different value can build the same modules again):")
         for d in r["differ"]:
-            say("  %s: %d values" % (d["setting"], len(d["values"])))
+            say("  %s (%s): %d values" % (d["name"], d["setting"], len(d["values"])))
             for v in d["values"]:
-                say("    %s: %s" % (v["value"] or "(not set)", label(v["targets"], 3)))
-        say("    Fix: set them once at the project level (or in a shared .xcconfig) unless a target really needs "
-            "its own.")
+                say("    %s: %s" % (v["value"], label(v["targets"], 3)))
+        say("     Set them once at the project level (or in a shared .xcconfig) unless a target really needs its "
+            "own.")
+        say("     More: %s#6-settings-that-shape-modules" % ARTICLE)
         say()
     if r["worth_trying"]:
         say("Worth trying (measure before and after):")
         for t in r["worth_trying"]:
-            say("  %s%s" % (t["note"], (" Targets: %s." % label(t["targets"])) if t["targets"] else ""))
-    say()
-    say("Change one setting at a time and time the same build before and after (time-build.sh or build_baseline.py).")
+            say("  %s (%s): %s%s" % (t["name"], t["setting"], t["why"],
+                                     (" Targets: %s." % label(t["targets"])) if t["targets"] else ""))
+        say()
+    say("Change one setting at a time, in the Debug configuration only, and time the same build before and after")
+    say("(time-build.sh or build_baseline.py). --json prints this report for scripts and coding agents.")
 
 
 def parse_args(argv):
@@ -338,18 +427,20 @@ def main(argv):
         raise Stop("%s refers to no .xcodeproj" % container, 2)
     say("Reading the build settings of %d project%s..." % (len(projects), "" if len(projects) == 1 else "s"))
     entries = read_settings(projects, args)
-    every_build, unread = script_phases(entries)
+    every_build, could_fuse, unread = script_phases(entries)
     report = {
         "container": container.name,
         "projects": [str(p) for p in projects],
         "configuration": args.configuration,
         "xcode": xcode_version(),
+        "article": ARTICLE,
         "targets": sorted(e["label"] for e in entries),
-        "worth_changing": worth_changing(entries),
+        "current": current_values(entries),
+        "to_change": to_change(entries),
         "every_build": every_build,
         "unreadable_projects": unread,
         "differ": differing(entries),
-        "worth_trying": worth_trying(entries, command_line_index=not (
+        "worth_trying": worth_trying(entries, could_fuse, command_line_index=not (
             any("COMPILER_INDEX_STORE_ENABLE=NO" in a for a in args.extra)
             or all(e["buildSettings"].get("COMPILER_INDEX_STORE_ENABLE") == "NO" for e in entries))),
     }

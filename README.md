@@ -243,15 +243,27 @@ python3 path/to/faster-builds/scripts/check_settings.py
 
 It reports, for the Debug configuration (`--configuration` for another one):
 
-- **Worth changing:** values that slow every build: Whole Module compilation, optimization, a dSYM file after every
+- **Current values:** every setting it checks, by its name in the Build Settings tab and its key, and how many
+  targets have each value.
+- **To change:** values that slow every build: Whole Module compilation, optimization, a dSYM file after every
   link, and every architecture instead of the active one.
 - **Script phases that run on every build:** each one, and why (no output files, or "Based on dependency
   analysis" turned off).
 - **Settings that differ between targets:** preprocessor macros, C language standard and automatic reference
   counting. Each different value can make the same modules build again for each target.
-- **Worth trying:** Eager Linking for dynamic frameworks, and skipping index data in command-line builds.
+- **Worth trying:** Eager Linking for dynamic frameworks, running script phases in parallel, and skipping index
+  data in command-line builds.
 
-`--json` prints the same report for scripts and coding agents. Swift packages keep their own settings and aren't
+Each finding says the value to use, why, and links to the section of the article that explains it. `--json`
+prints the same report for scripts and coding agents. To have an agent check the project and make the changes:
+
+> Read https://quickfirebuild.com/blog/debug-build-settings/. Then run
+> `python3 path/to/faster-builds/scripts/check_settings.py --json` from the project folder. For each finding,
+> tell me the setting, the targets, the current and recommended value, and why, and wait for my go-ahead. Then
+> change only the Debug configuration: in the `.xcconfig` file if the project sets that setting there, otherwise
+> in the target's build settings in `project.pbxproj`. For CocoaPods targets, change the Podfile's `post_install`
+> hook instead of the Pods project. Don't touch Release. Time the same build before and after with
+> `time-build.sh`. Swift packages keep their own settings and aren't
 checked. What each setting does, and the value it should have, is in
 [the debug build settings that decide how long you wait](https://quickfirebuild.com/blog/debug-build-settings/).
 
