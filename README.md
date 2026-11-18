@@ -18,10 +18,11 @@ The full article, with more on each step: [How to read your build timeline and f
 | [`timing-summary.sh`](scripts/timing-summary.sh) | Prints the build's time by kind of task, and the script phases that run on every build | 3, 5 |
 | [`slow-type-checks.sh`](scripts/slow-type-checks.sh) | Lists the functions and expressions slowest to type-check | 5 |
 | [`build_baseline.py`](scripts/build_baseline.py) | Does steps 2 and 3 in one command, with step 5's type-check list if you ask: finds the workspace, scheme and Simulator, makes the edits for you and puts them back | 2, 3, 5 |
+| [`check_settings.py`](scripts/check_settings.py) | Checks every target's debug build settings and script phases for the ones that slow every build; builds nothing | 5 |
 
 They need macOS with Xcode installed (`xcode-select -p` shows which one runs) and nothing else: the `.sh` scripts
 are `zsh`, the shell every Mac has, and `build_baseline.py` uses the `python3` that comes with Xcode. None of the
-`.sh` scripts changes your project (`build_baseline.py` edits two files for a while and puts them back; see
+`.sh` scripts or `check_settings.py` changes your project (`build_baseline.py` edits two files for a while and puts them back; see
 below). Each `.sh` script takes your usual `xcodebuild` arguments after `--`:
 
 ```sh
@@ -229,6 +230,30 @@ It builds into a temporary folder, so your normal build folder and settings stay
 build and takes as long as a clean one. To keep the warnings on in the IDE instead, add
 `-Xfrontend -warn-long-function-bodies=200 -Xfrontend -warn-long-expression-type-checking=200` to Other Swift Flags
 for the Debug configuration.
+
+## Check your build settings
+
+`check_settings.py` reads the build settings of every target in your project, or in each project of your
+workspace (CocoaPods' too), and the script phases from the project files. It builds nothing and changes nothing:
+
+```sh
+cd path/to/your/app
+python3 path/to/faster-builds/scripts/check_settings.py
+```
+
+It reports, for the Debug configuration (`--configuration` for another one):
+
+- **Worth changing:** values that slow every build: Whole Module compilation, optimization, a dSYM file after every
+  link, and every architecture instead of the active one.
+- **Script phases that run on every build:** each one, and why (no output files, or "Based on dependency
+  analysis" turned off).
+- **Settings that differ between targets:** preprocessor macros, C language standard and automatic reference
+  counting. Each different value can make the same modules build again for each target.
+- **Worth trying:** Eager Linking for dynamic frameworks, and skipping index data in command-line builds.
+
+`--json` prints the same report for scripts and coding agents. Swift packages keep their own settings and aren't
+checked. What each setting does, and the value it should have, is in
+[the debug build settings that decide how long you wait](https://quickfirebuild.com/blog/debug-build-settings/).
 
 ## What this won't show you
 
